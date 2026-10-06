@@ -143,6 +143,57 @@ def _sniff(blob: bytes) -> str:
     return "unknown"
 
 
+def parse_units(payloads: List[InputPayload]):
+    """把已校验的输入载荷解析为裁决单元。
+
+    返回 (units, input_records)；字节级违例抛 AuditRejected（CORRUPT_BINARY）。
+    修复建议重放原冻结输入时复用同一解析路径，保证两次裁决所见单元一致。
+    """
+    units: List[InputUnit] = []
+    input_records = []
+    for p in payloads:
+        kind = _sniff(p.blob)
+        record = {
+            "position": p.position,
+            "name": p.name,
+            "group": p.group,
+            "bytes": len(p.blob),
+            "kind": kind,
+        }
+        if kind == "unknown":
+            raise AuditRejected(
+                "ILLEGAL_MEMBER",
+                f"输入#{p.position} {p.name} 既非 ELF 也非 ar 归档"
+                f"（头部 {p.blob[:8]!r}）",
+                f"输入#{p.position} {p.name} byte 0",
+                {"magic": p.blob[:8].hex(), "input": record},
+            )
+        try:
+            if kind == "elf":
+                obj = parse_elf_object(p.blob, f"输入#{p.position} {p.name}")
+                record["symbols"] = len(obj.symbols)
+                units.append(InputUnit(p.position, p.name, "object", obj=obj,
+                                       group=p.group))
+            else:
+                archive = parse_ar(p.blob, f"输入#{p.position} {p.name}")
+                record["members"] = [
+                    {"name": m.name, "symbols": len(m.parsed.symbols)}
+                    for m in archive.member_order
+                ]
+                record["index_symbols"] = len(archive.symbol_index)
+                units.append(InputUnit(p.position, p.name, "archive",
+                                       archive=archive, group=p.group))
+        except ParseError as exc:
+            raise AuditRejected(
+                "CORRUPT_BINARY",
+                exc.message,
+                exc.where or f"输入#{p.position} {p.name}",
+                {"input": record, **exc.evidence},
+            )
+        input_records.append(record)
+    return units, input_records
+
+
 def audit(audit_id: str, raw_inputs: list) -> dict:
     """执行完整审计；任何违例抛 AuditRejected。返回可冻结的结论字典。"""
     payloads = validate_request(audit_id, raw_inputs)
@@ -163,51 +214,10 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
             "resolutions": getattr(resolver, "resolutions", []),
         }
 
-    units: List[InputUnit] = []
-    input_records = []
+    input_records: list = []
     resolver: Optional[Resolver] = None
     try:
-        for p in payloads:
-            kind = _sniff(p.blob)
-            record = {
-                "position": p.position,
-                "name": p.name,
-                "group": p.group,
-                "bytes": len(p.blob),
-                "kind": kind,
-            }
-            try:
-                if kind == "unknown":
-                    raise AuditRejected(
-                        "ILLEGAL_MEMBER",
-                        f"输入#{p.position} {p.name} 既非 ELF 也非 ar 归档"
-                        f"（头部 {p.blob[:8]!r}）",
-                        f"输入#{p.position} {p.name} byte 0",
-                        {"magic": p.blob[:8].hex(), "input": record},
-                    )
-                if kind == "elf":
-                    obj = parse_elf_object(p.blob, f"输入#{p.position} {p.name}")
-                    record["symbols"] = len(obj.symbols)
-                    units.append(InputUnit(p.position, p.name, "object", obj=obj,
-                                           group=p.group))
-                else:
-                    archive = parse_ar(p.blob, f"输入#{p.position} {p.name}")
-                    record["members"] = [
-                        {"name": m.name, "symbols": len(m.parsed.symbols)}
-                        for m in archive.member_order
-                    ]
-                    record["index_symbols"] = len(archive.symbol_index)
-                    units.append(InputUnit(p.position, p.name, "archive",
-                                           archive=archive, group=p.group))
-            except ParseError as exc:
-                raise AuditRejected(
-                    "CORRUPT_BINARY",
-                    exc.message,
-                    exc.where or f"输入#{p.position} {p.name}",
-                    {"input": record, **exc.evidence},
-                )
-            input_records.append(record)
-
+        units, input_records = parse_units(payloads)
         resolver = Resolver(units=units)
         result = resolver.run()
     except AuditRejected as exc:
