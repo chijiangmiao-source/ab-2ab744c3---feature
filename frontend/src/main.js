@@ -216,6 +216,12 @@ function renderVerdict(v, { frozen = false, reopened = false } = {}) {
         <table><tr><th>先定义</th><td class="mono">${escapeHtml(ev.first_definition)}</td></tr>
         <tr><th>冲突定义</th><td class="mono">${escapeHtml(ev.conflicting_definition ?? '')}</td></tr></table>`;
     }
+    // 修复建议入口：仅基于原冻结输入枚举相邻未分组归档段重裁
+    html += `<div class="fix-entry">
+      <button id="fixBtn" class="btn small" type="button">🛠 分析相邻归档成组修复建议</button>
+      <span class="fix-note">只读分析：仅基于原冻结输入重放，不改写冻结结论</span>
+      <div id="fixResult"></div>
+    </div>`;
   }
 
   html += renderInputs(v.inputs ?? []);
@@ -226,6 +232,72 @@ function renderVerdict(v, { frozen = false, reopened = false } = {}) {
     html += `<h3>弱未定义（不判错）</h3><div class="undef-set">${v.weak_unresolved.map(escapeHtml).join(', ')}</div>`;
   }
   verdictEl.innerHTML = html;
+  const fixBtn = document.getElementById('fixBtn');
+  if (fixBtn) {
+    fixBtn.addEventListener('click', () => loadFixSuggestion(v.audit_id));
+  }
+}
+
+// --------------------------------------------------------------------------- //
+// 修复建议：枚举相邻未分组归档段，按既有成组语义重裁（只读，不改写冻结结论）
+// --------------------------------------------------------------------------- //
+async function loadFixSuggestion(auditId) {
+  const box = document.getElementById('fixResult');
+  const btn = document.getElementById('fixBtn');
+  if (!box) return;
+  if (btn) btn.disabled = true;
+  box.innerHTML = '<div class="empty">正在基于原冻结输入枚举候选段并重裁…</div>';
+  try {
+    const res = await fetch(`/api/audits/${encodeURIComponent(auditId)}/fix-suggestion`);
+    const body = await res.json();
+    box.innerHTML = renderFixSuggestion(body, res.status);
+  } catch (e) {
+    box.innerHTML = `<div class="fix-panel fail">网络错误：${escapeHtml(e.message)}</div>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderFixSuggestion(body, httpStatus) {
+  if (httpStatus === 200 && body.status === 'suggested') {
+    const s = body.suggestion;
+    const seg = s.segment;
+    const names = (seg.archives ?? []).map((a) => `#${a.position} ${escapeHtml(a.name)}`).join('、');
+    let html = `<div class="fix-panel ok">
+      <div class="fix-title">✔ 唯一最短修复段：将连续 ${seg.length} 个未分组归档置入同一链接组即可闭合</div>
+      <table>
+        <tr><th>段首尾</th><td class="mono">输入 #${seg.start_position} → #${seg.end_position}</td></tr>
+        <tr><th>段内归档</th><td class="mono">${names}</td></tr>
+        <tr><th>建议组标签</th><td class="mono">${tag('组 ' + s.group)}</td></tr>
+        <tr><th>消失的未定义集合</th><td class="undef-set">{${(s.resolved_undefined ?? []).map(escapeHtml).join(', ')}} → ∅</td></tr>
+      </table>
+      <h3>成组重裁后的归档成员抽取顺序</h3>
+      ${renderExtraction(s.extraction_order ?? [])}
+      ${renderRounds(s.rounds ?? [])}
+      <div class="fix-note">已按 (段长, 起始位置) 稳定选择最短段，共检查 ${body.candidates_checked} 个候选；原冻结结论与输入顺序未被改写。</div>
+    </div>`;
+    return html;
+  }
+
+  const reason = body.reason ?? {};
+  const candidates = body.candidates ?? [];
+  let html = `<div class="fix-panel fail">
+    <div class="fix-title">✖ 无可行成组修复段 · ${escapeHtml(reason.code ?? `HTTP ${httpStatus}`)}</div>
+    <div style="font-size:.8rem">${escapeHtml(reason.message ?? '未知原因')}</div>`;
+  if (candidates.length) {
+    const rows = candidates.map((c) => `<tr>
+      <td class="mono">#${c.segment.start_position} → #${c.segment.end_position}</td>
+      <td class="mono">${(c.segment.archives ?? []).map((a) => escapeHtml(a.name)).join(', ')}</td>
+      <td>${tag(c.error?.code ?? '', 'err')}</td>
+      <td class="mono" style="font-size:.7rem">${escapeHtml(c.error?.location ?? '')}</td>
+    </tr>`).join('');
+    html += `<h3>候选段重放结果（${candidates.length}）</h3>
+      <div class="scroll"><table>
+        <tr><th>段首尾</th><th>段内归档</th><th>重放拒绝码</th><th>首触发位置</th></tr>${rows}
+      </table></div>`;
+  }
+  html += `<div class="fix-note">原冻结结论、输入顺序与既有重开结果均未被改写。</div></div>`;
+  return html;
 }
 
 function renderInputs(inputs) {

@@ -143,6 +143,53 @@ def _sniff(blob: bytes) -> str:
     return "unknown"
 
 
+def _build_units(payloads: List[InputPayload]):
+    """把解码后的输入解析为链接单元与输入记录；违例抛 AuditRejected。"""
+    units: List[InputUnit] = []
+    input_records = []
+    for p in payloads:
+        kind = _sniff(p.blob)
+        record = {
+            "position": p.position,
+            "name": p.name,
+            "group": p.group,
+            "bytes": len(p.blob),
+            "kind": kind,
+        }
+        try:
+            if kind == "unknown":
+                raise AuditRejected(
+                    "ILLEGAL_MEMBER",
+                    f"输入#{p.position} {p.name} 既非 ELF 也非 ar 归档"
+                    f"（头部 {p.blob[:8]!r}）",
+                    f"输入#{p.position} {p.name} byte 0",
+                    {"magic": p.blob[:8].hex(), "input": record},
+                )
+            if kind == "elf":
+                obj = parse_elf_object(p.blob, f"输入#{p.position} {p.name}")
+                record["symbols"] = len(obj.symbols)
+                units.append(InputUnit(p.position, p.name, "object", obj=obj,
+                                       group=p.group))
+            else:
+                archive = parse_ar(p.blob, f"输入#{p.position} {p.name}")
+                record["members"] = [
+                    {"name": m.name, "symbols": len(m.parsed.symbols)}
+                    for m in archive.member_order
+                ]
+                record["index_symbols"] = len(archive.symbol_index)
+                units.append(InputUnit(p.position, p.name, "archive",
+                                       archive=archive, group=p.group))
+        except ParseError as exc:
+            raise AuditRejected(
+                "CORRUPT_BINARY",
+                exc.message,
+                exc.where or f"输入#{p.position} {p.name}",
+                {"input": record, **exc.evidence},
+            )
+        input_records.append(record)
+    return units, input_records
+
+
 def audit(audit_id: str, raw_inputs: list) -> dict:
     """执行完整审计；任何违例抛 AuditRejected。返回可冻结的结论字典。"""
     payloads = validate_request(audit_id, raw_inputs)
@@ -167,47 +214,7 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
     input_records = []
     resolver: Optional[Resolver] = None
     try:
-        for p in payloads:
-            kind = _sniff(p.blob)
-            record = {
-                "position": p.position,
-                "name": p.name,
-                "group": p.group,
-                "bytes": len(p.blob),
-                "kind": kind,
-            }
-            try:
-                if kind == "unknown":
-                    raise AuditRejected(
-                        "ILLEGAL_MEMBER",
-                        f"输入#{p.position} {p.name} 既非 ELF 也非 ar 归档"
-                        f"（头部 {p.blob[:8]!r}）",
-                        f"输入#{p.position} {p.name} byte 0",
-                        {"magic": p.blob[:8].hex(), "input": record},
-                    )
-                if kind == "elf":
-                    obj = parse_elf_object(p.blob, f"输入#{p.position} {p.name}")
-                    record["symbols"] = len(obj.symbols)
-                    units.append(InputUnit(p.position, p.name, "object", obj=obj,
-                                           group=p.group))
-                else:
-                    archive = parse_ar(p.blob, f"输入#{p.position} {p.name}")
-                    record["members"] = [
-                        {"name": m.name, "symbols": len(m.parsed.symbols)}
-                        for m in archive.member_order
-                    ]
-                    record["index_symbols"] = len(archive.symbol_index)
-                    units.append(InputUnit(p.position, p.name, "archive",
-                                           archive=archive, group=p.group))
-            except ParseError as exc:
-                raise AuditRejected(
-                    "CORRUPT_BINARY",
-                    exc.message,
-                    exc.where or f"输入#{p.position} {p.name}",
-                    {"input": record, **exc.evidence},
-                )
-            input_records.append(record)
-
+        units, input_records = _build_units(payloads)
         resolver = Resolver(units=units)
         result = resolver.run()
     except AuditRejected as exc:
@@ -234,4 +241,169 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
         "error": None,
         "inputs": input_records,
         **result,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 修复建议：枚举相邻未分组归档段，按既有成组语义重放裁决
+# --------------------------------------------------------------------------- #
+FIX_GROUP_BASE = "FIXG"
+
+
+def _candidate_segments(units: List[InputUnit]):
+    """全部候选段：两个及以上连续、未分组的普通归档。
+
+    返回按 (段长, 起始下标) 升序的 [start, end)（0 基下标）区间列表，
+    保证最短段优先、等长按起始输入位置稳定选择。
+    """
+    n = len(units)
+    plain = [u.kind == "archive" and not u.group for u in units]
+    segments = []
+    i = 0
+    while i < n:
+        if not plain[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and plain[j + 1]:
+            j += 1
+        # [i, j] 为一段极大的连续未分组归档
+        for length in range(2, j - i + 2):
+            for start in range(i, j - length + 2):
+                segments.append((start, start + length))
+        i = j + 1
+    segments.sort(key=lambda seg: (seg[1] - seg[0], seg[0]))
+    return segments
+
+
+def _fresh_group_label(units: List[InputUnit]) -> str:
+    used = {u.group for u in units if u.group}
+    label = FIX_GROUP_BASE
+    n = 1
+    while label in used:
+        n += 1
+        label = f"{FIX_GROUP_BASE}{n}"
+    return label
+
+
+def _segment_record(units: List[InputUnit], start: int, end: int) -> dict:
+    return {
+        "start_position": units[start].position,
+        "end_position": units[end - 1].position,
+        "length": end - start,
+        "archives": [
+            {"position": u.position, "name": u.name} for u in units[start:end]
+        ],
+    }
+
+
+def suggest_group_fix(audit_id: str, verdict: dict,
+                      raw_inputs: Optional[list]) -> dict:
+    """基于原冻结输入枚举候选段并重放裁决；不改动任何冻结结论。
+
+    仅接受原拒绝原因为最终未定义（UNDEFINED_SYMBOL）且输入仍可重放的审计。
+    返回可使裁决通过的最短段（等长按起始输入位置稳定选择）。
+    """
+    error = verdict.get("error") or {}
+    if verdict.get("status") != "rejected" or error.get("code") != "UNDEFINED_SYMBOL":
+        raise AuditRejected(
+            "NOT_UNDEFINED_REJECTION",
+            "修复建议仅适用于因最终未定义符号（UNDEFINED_SYMBOL）被拒绝的"
+            f"冻结审计；该审计状态为 {verdict.get('status')!r}"
+            + (f"，拒绝码 {error.get('code')!r}" if error else ""),
+            f"audit_id={audit_id}",
+            {"status": verdict.get("status"), "code": error.get("code")},
+            http_status=409,
+        )
+    if raw_inputs is None:
+        raise AuditRejected(
+            "INPUTS_NOT_REPLAYABLE",
+            "该冻结结论未留存原始输入字节（功能上线前冻结），无法按原输入重放",
+            f"audit_id={audit_id}",
+            http_status=409,
+        )
+
+    try:
+        payloads = validate_request(audit_id, raw_inputs)
+        units, _records = _build_units(payloads)
+    except AuditRejected as exc:
+        raise AuditRejected(
+            "INPUTS_NOT_REPLAYABLE",
+            f"原冻结输入已无法重放：{exc.message}",
+            exc.location,
+            {"rejected_code": exc.code},
+            http_status=409,
+        )
+
+    original_undefined = sorted((error.get("evidence") or {}).get("undefined") or [])
+    segments = _candidate_segments(units)
+    candidates = []
+    duplicate_strong_seen = False
+
+    for start, end in segments:
+        label = _fresh_group_label(units)
+        trial = [
+            InputUnit(u.position, u.name, u.kind, obj=u.obj, archive=u.archive,
+                      group=label if start <= idx < end else u.group)
+            for idx, u in enumerate(units)
+        ]
+        resolver = Resolver(units=trial)
+        segment = _segment_record(units, start, end)
+        try:
+            result = resolver.run()
+        except LinkError as exc:
+            duplicate_strong_seen = (
+                duplicate_strong_seen or exc.code == "DUPLICATE_STRONG"
+            )
+            candidates.append({
+                "segment": segment,
+                "group": label,
+                "outcome": "rejected",
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "location": exc.location,
+                },
+            })
+            continue
+        # 首个成功即最短段（候选已按段长、起始位置排序）
+        return {
+            "audit_id": audit_id,
+            "status": "suggested",
+            "suggestion": {
+                "segment": segment,
+                "group": label,
+                "resolved_undefined": original_undefined,
+                "extraction_order": result["extraction_order"],
+                "rounds": result["rounds"],
+                "final_undefined": result["final_undefined"],
+            },
+            "candidates_checked": len(candidates) + 1,
+            "frozen_verdict_untouched": True,
+        }
+
+    if not segments:
+        reason = {
+            "code": "NO_CANDIDATE_SEGMENT",
+            "message": "输入中不存在两个及以上连续、未分组的 GNU ar 归档，"
+                       "没有可成组重放的候选段",
+        }
+    elif duplicate_strong_seen:
+        reason = {
+            "code": "DUPLICATE_STRONG_IN_REPLAY",
+            "message": "候选段按成组语义重放时出现重复强定义，"
+                       "没有可使裁决通过的成组段",
+        }
+    else:
+        reason = {
+            "code": "NO_FEASIBLE_SEGMENT",
+            "message": "全部候选段重放后仍残留未定义符号，"
+                       "没有可使裁决通过的成组段",
+        }
+    return {
+        "audit_id": audit_id,
+        "status": "no_suggestion",
+        "reason": reason,
+        "candidates": candidates,
+        "frozen_verdict_untouched": True,
     }

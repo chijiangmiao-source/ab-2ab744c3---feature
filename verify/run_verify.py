@@ -202,6 +202,107 @@ def _freeze_reopen() -> str:
     return "201 → 409(冻结) → 200(重开)"
 
 
+def _post_ungrouped_cycle(prefix: str):
+    """跨归档循环、全部去组：原裁决残留 b 未定义。返回 (audit_id, 冻结结论)。"""
+    _, demo = _request("GET", "/api/demo/cycle")
+    demo["audit_id"] = _tag(prefix)
+    for item in demo["inputs"]:
+        item["group"] = None
+    status, body = _request("POST", "/api/audits", demo)
+    if status != 422 or body["error"]["code"] != "UNDEFINED_SYMBOL":
+        raise AssertionError(f"前置拒绝构造失败: status={status} {json.dumps(body)[:400]}")
+    return demo["audit_id"], body
+
+
+@step("修复建议：跨归档循环拒绝取得唯一最短段")
+def _fix_suggestion_unique() -> str:
+    fid, frozen = _post_ungrouped_cycle("VERIFY-FIX")
+    status, body = _request("GET", f"/api/audits/{fid}/fix-suggestion")
+    if status != 200 or body.get("status") != "suggested":
+        raise AssertionError(f"期望唯一建议，实际 status={status} {json.dumps(body, ensure_ascii=False)[:500]}")
+    seg = body["suggestion"]["segment"]
+    if (seg["start_position"], seg["end_position"], seg["length"]) != (2, 3, 2):
+        raise AssertionError(f"段首尾应为 2→3，实际 {seg}")
+    if [a["name"] for a in seg["archives"]] != ["libX.a", "libY.a"]:
+        raise AssertionError(f"段内归档不符: {seg['archives']}")
+    if body["suggestion"]["resolved_undefined"] != ["b"]:
+        raise AssertionError(f"消失的未定义集合应为 [b]，实际 {body['suggestion']['resolved_undefined']}")
+    if len(body["suggestion"]["extraction_order"]) != 3:
+        raise AssertionError("成组重裁应抽取 3 个成员")
+    # 只读性：重开原冻结结论，内容与建议前完全一致
+    s2, reopened = _request("GET", f"/api/audits/{fid}")
+    if s2 != 200 or reopened != frozen:
+        raise AssertionError("修复建议改写了原冻结结论")
+    return f"段 #2→#3 (libX.a, libY.a)，消失未定义 {body['suggestion']['resolved_undefined']}"
+
+
+@step("修复建议：无解段与重复强定义均给出明确原因")
+def _fix_suggestion_negative() -> str:
+    sys.path.insert(0, str(BACKEND))
+    from app.fixtures import ObjSpec, b64, build_elf64_rel, build_gnu_ar
+
+    def obj(spec, group=None):
+        return {"name": spec.name + ".o", "data_b64": b64(build_elf64_rel(spec)),
+                "group": group}
+
+    def ar(name, specs, group=None):
+        return {"name": name + ".a", "data_b64": b64(build_gnu_ar(name, specs)),
+                "group": group}
+
+    # 1) 无可行段：ghost 任何归档都不提供
+    payload = {"audit_id": _tag("VERIFY-FIXNONE"), "inputs": [
+        obj(ObjSpec("m", undefined=["ghost"])),
+        ar("libA", [ObjSpec("pa", strong=["pa"])]),
+        ar("libB", [ObjSpec("pb", strong=["pb"])]),
+    ]}
+    s1, b1 = _request("POST", "/api/audits", payload)
+    if s1 != 422 or b1["error"]["code"] != "UNDEFINED_SYMBOL":
+        raise AssertionError(f"前置拒绝构造失败: {s1} {json.dumps(b1)[:300]}")
+    s2, b2 = _request("GET", f"/api/audits/{payload['audit_id']}/fix-suggestion")
+    if s2 != 200 or b2.get("status") != "no_suggestion" \
+            or b2["reason"]["code"] != "NO_FEASIBLE_SEGMENT":
+        raise AssertionError(f"期望 NO_FEASIBLE_SEGMENT，实际 {s2} {json.dumps(b2, ensure_ascii=False)[:400]}")
+
+    # 2) 候选重放触发重复强定义：成组后 xmem 被抽取，d 与 dmem 冲突
+    payload = {"audit_id": _tag("VERIFY-FIXDUP"), "inputs": [
+        obj(ObjSpec("m", undefined=["a"])),
+        ar("libX", [ObjSpec("amem", strong=["a"], undefined=["c"]),
+                    ObjSpec("xmem", strong=["x", "d"])]),
+        ar("libY", [ObjSpec("cmem", strong=["c"], undefined=["x", "e"]),
+                    ObjSpec("dmem", strong=["e", "d"])]),
+    ]}
+    s3, b3 = _request("POST", "/api/audits", payload)
+    if s3 != 422 or b3["error"]["evidence"]["undefined"] != ["x"]:
+        raise AssertionError(f"前置拒绝构造失败: {s3} {json.dumps(b3)[:300]}")
+    s4, b4 = _request("GET", f"/api/audits/{payload['audit_id']}/fix-suggestion")
+    if s4 != 200 or b4.get("status") != "no_suggestion" \
+            or b4["reason"]["code"] != "DUPLICATE_STRONG_IN_REPLAY":
+        raise AssertionError(f"期望 DUPLICATE_STRONG_IN_REPLAY，实际 {s4} {json.dumps(b4, ensure_ascii=False)[:400]}")
+    return "NO_FEASIBLE_SEGMENT 与 DUPLICATE_STRONG_IN_REPLAY 均明确返回"
+
+
+@step("修复建议：非该类拒绝与既有成功审计保持原状")
+def _fix_suggestion_guards() -> str:
+    _, demo = _request("GET", "/api/demo/cycle")
+    fid = _tag("VERIFY-FIXGUARD"); demo["audit_id"] = fid
+    s1, accepted = _request("POST", "/api/audits", demo)
+    if s1 != 201:
+        raise AssertionError(f"前置成功审计构造失败: {s1}")
+    # 成功审计不属于最终未定义拒绝：明确拒绝且不改写
+    s2, b2 = _request("GET", f"/api/audits/{fid}/fix-suggestion")
+    if s2 != 409 or b2.get("reason", {}).get("code") != "NOT_UNDEFINED_REJECTION":
+        raise AssertionError(f"期望 409 NOT_UNDEFINED_REJECTION，实际 {s2} {json.dumps(b2, ensure_ascii=False)[:300]}")
+    # 未知标识
+    s3, b3 = _request("GET", "/api/audits/VERIFY-NO-SUCH-ID/fix-suggestion")
+    if s3 != 404:
+        raise AssertionError(f"未知标识应 404，实际 {s3}")
+    # 既有成功审计重开结果保持原状
+    s4, reopened = _request("GET", f"/api/audits/{fid}")
+    if s4 != 200 or reopened != accepted:
+        raise AssertionError("既有成功审计的重开结果被改写")
+    return "成功审计 409 明确拒绝、未知标识 404、重开内容不变"
+
+
 def main() -> int:
     # 测试与构建不依赖后端，先跑；冒烟前等待健康端点。
     _parser_tests()
@@ -212,6 +313,9 @@ def main() -> int:
     _duplicate_strong()
     _corrupt_index()
     _freeze_reopen()
+    _fix_suggestion_unique()
+    _fix_suggestion_negative()
+    _fix_suggestion_guards()
 
     print("\n================ verify 汇总 ================")
     width = max(len(n) for n, _, _ in results)

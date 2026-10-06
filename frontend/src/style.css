@@ -143,6 +143,18 @@ summary { cursor: pointer; font-size: 0.78rem; color: var(--muted); margin-botto
 .loc { color: #ffb3b6; font-family: var(--mono); font-size: 0.74rem; }
 .undef-set { font-family: var(--mono); font-size: 0.72rem; color: #ffd089; word-break: break-all; }
 .frozen-note { font-size: 0.72rem; color: var(--muted); margin-top: 6px; }
+.fix-entry {
+  margin-top: 14px; padding: 10px 12px; border: 1px dashed var(--line);
+  border-radius: 10px;
+}
+.fix-note { font-size: 0.7rem; color: var(--muted); margin-left: 8px; }
+.fix-panel { margin-top: 10px; border-radius: 10px; padding: 10px 12px; }
+.fix-panel.ok { background: rgba(47, 191, 113, 0.08); border: 1px solid var(--ok); }
+.fix-panel.fail { background: rgba(232, 161, 58, 0.08); border: 1px solid var(--warn); }
+.fix-panel .fix-title { font-weight: 600; font-size: 0.85rem; margin-bottom: 8px; }
+.fix-panel.ok .fix-title { color: #9be8be; }
+.fix-panel.fail .fix-title { color: #ffd089; }
+.fix-panel .fix-note { display: block; margin: 8px 0 0; }
 @media (max-width: 980px) {
   .layout { grid-template-columns: 1fr; }
 }

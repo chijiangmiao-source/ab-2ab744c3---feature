@@ -57,6 +57,7 @@ Dockerfile.verify   verify 服务镜像
 | `GET /health` | 健康检查 |
 | `POST /api/audits` | 提交 `{audit_id, audit_type:"link_closure", inputs:[{name,data_b64,group?}]}` |
 | `GET /api/audits/{audit_id}` | 按标识重开冻结结论 |
+| `GET /api/audits/{audit_id}/fix-suggestion` | 修复建议：仅基于原冻结输入枚举相邻未分组归档段重裁（只读） |
 | `GET /api/audits` | 列出冻结标识 |
 | `GET /api/demo/cycle` | 页面示例：成组后闭合的跨归档循环 |
 
@@ -69,6 +70,24 @@ Dockerfile.verify   verify 服务镜像
 未定义集合、是否触发错误）、`rounds`（归档逐趟/组逐轮的抽取与未定义集合）、
 `resolutions`、`definitions`、`weak_unresolved`；拒绝时 `error.location`
 为首触发位置，`error.evidence` 含冲突双方或未定义集合。
+
+## 修复建议（相邻归档成组）
+
+详情页对拒绝结论提供「分析相邻归档成组修复建议」入口，对应
+`GET /api/audits/{audit_id}/fix-suggestion`（只读，不改写任何冻结结论）：
+
+- 仅接受原拒绝原因为最终未定义（`UNDEFINED_SYMBOL`）且原始输入仍随冻结
+  留存、可重放的审计；否则返回 `409` 与明确原因
+  （`NOT_UNDEFINED_REJECTION` / `INPUTS_NOT_REPLAYABLE`）。
+- 仅基于原冻结输入，枚举全部「两个及以上连续、未分组 GNU ar 归档」候选段，
+  将该段按既有成组语义（`--start-group` 反复扫描至收敛）重新裁决。
+- 返回可使裁决通过的**最短段**（等长按起始输入位置稳定选择）：段首尾位置、
+  段内归档名、建议组标签、成组重裁后的抽取顺序/轮次，以及消失的未定义集合。
+- 无可行段时返回 `200` + `status:"no_suggestion"` 与明确原因
+  （`NO_CANDIDATE_SEGMENT` 无候选段、`NO_FEASIBLE_SEGMENT` 重放仍残留未定义、
+  `DUPLICATE_STRONG_IN_REPLAY` 候选重放出现重复强定义），并附各候选段重放结果。
+- 原始提交输入随冻结一并留存在独立表 `audit_inputs`（功能上线前冻结的结论
+  无留存，按 `INPUTS_NOT_REPLAYABLE` 处理）；按标识重开的结论内容不受影响。
 
 ## 本地运行
 
@@ -102,7 +121,10 @@ docker compose up --build
 3. 等待 `backend` 健康端点；
 4. HTTP 冒烟：成组循环闭合（accepted）、不成组残留未定义（rejected）、
    重复强定义（DUPLICATE_STRONG，首触发位置）、损坏索引（CORRUPT_BINARY）、
-   冻结与按标识重开（201 → 409 → 200）。
+   冻结与按标识重开（201 → 409 → 200）；
+5. 修复建议：跨归档循环拒绝取得唯一最短段（段 #2→#3、消失未定义集合、
+   重裁抽取顺序，且原冻结结论不变）、无解段与候选重放重复强定义的明确原因、
+   非该类拒绝（含既有成功审计）409 且重开内容保持原状。
 
 全部通过退出码 `0`，任一失败非零。单独复跑：
 

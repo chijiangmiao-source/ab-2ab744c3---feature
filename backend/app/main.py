@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .service import AuditRejected, audit
+from .service import AuditRejected, audit, suggest_group_fix
 from .fixtures import ObjSpec, b64, build_elf64_rel, build_gnu_ar
 from .storage import AuditStore
 
@@ -99,6 +99,45 @@ def reopen(audit_id: str) -> JSONResponse:
     return JSONResponse(content=verdict)
 
 
+@app.get("/api/audits/{audit_id}/fix-suggestion")
+def fix_suggestion(audit_id: str) -> JSONResponse:
+    """修复建议：仅基于原冻结输入，枚举相邻未分组归档段按成组语义重裁。
+
+    只读接口：不改动原冻结结论、输入顺序与既有重开结果。
+    """
+    verdict = store.get(audit_id)
+    if verdict is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"审计标识 {audit_id!r} 尚无冻结结论",
+                    "location": "path",
+                },
+            },
+        )
+    try:
+        result = suggest_group_fix(audit_id, verdict, store.get_inputs(audit_id))
+    except AuditRejected as exc:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={
+                "audit_id": audit_id,
+                "status": "no_suggestion",
+                "reason": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "location": exc.location,
+                    "evidence": exc.evidence,
+                },
+                "frozen_verdict_untouched": True,
+            },
+        )
+    return JSONResponse(content=result)
+
+
 @app.post("/api/audits")
 async def submit(req: AuditRequest) -> JSONResponse:
     if req.audit_type != "link_closure":
@@ -132,7 +171,11 @@ async def submit(req: AuditRequest) -> JSONResponse:
             },
         )
 
-    created = store.save(audit_id=req.audit_id, verdict=verdict)
+    created = store.save(
+        audit_id=req.audit_id,
+        verdict=verdict,
+        inputs=[i.model_dump() for i in req.inputs],
+    )
     if not created:
         # 同一稳定标识的结论已冻结：忽略本次重算，返回既有冻结结论。
         frozen = store.get(req.audit_id)
